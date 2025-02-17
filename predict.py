@@ -11,7 +11,7 @@ import torch
 from cog import BasePredictor, Input, Path
 from diffusers import (
     DDIMScheduler,
-    DiffusionPipeline,
+    StableDiffusionXLPipeline,
     DPMSolverMultistepScheduler,
     EulerAncestralDiscreteScheduler,
     EulerDiscreteScheduler,
@@ -173,7 +173,7 @@ class Predictor(BasePredictor):
             download_weights(SDXL_URL, SDXL_MODEL_CACHE)
 
         print("Loading sdxl txt2img pipeline...")
-        self.txt2img_pipe = DiffusionPipeline.from_pretrained(
+        self.txt2img_pipe = StableDiffusionXLPipeline.from_pretrained(
             SDXL_MODEL_CACHE,
             torch_dtype=torch.float16,
             use_safetensors=True,
@@ -219,7 +219,7 @@ class Predictor(BasePredictor):
             download_weights(REFINER_URL, REFINER_MODEL_CACHE)
 
         print("Loading refiner pipeline...")
-        self.refiner = DiffusionPipeline.from_pretrained(
+        self.refiner = StableDiffusionXLPipeline.from_pretrained(
             REFINER_MODEL_CACHE,
             text_encoder_2=self.txt2img_pipe.text_encoder_2,
             vae=self.txt2img_pipe.vae,
