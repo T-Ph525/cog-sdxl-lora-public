@@ -221,7 +221,9 @@ class Predictor(BasePredictor):
         print("Loading refiner pipeline...")
         self.refiner = StableDiffusionXLPipeline.from_pretrained(
             REFINER_MODEL_CACHE,
+            text_encoder=self.txt2img_pipe.text_encoder,
             text_encoder_2=self.txt2img_pipe.text_encoder_2,
+            tokenizer=self.txt2img_pipe.tokenizer,
             vae=self.txt2img_pipe.vae,
             torch_dtype=torch.float16,
             use_safetensors=True,
