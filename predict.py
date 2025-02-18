@@ -2,7 +2,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -21,31 +20,21 @@ from diffusers import (
     StableDiffusionXLInpaintPipeline,
 )
 from diffusers.models.attention_processor import LoRAAttnProcessor2_0
-from diffusers.pipelines.stable_diffusion.safety_checker import (
-    StableDiffusionSafetyChecker,
-)
 from diffusers.utils import load_image
 from safetensors import safe_open
 from safetensors.torch import load_file
-from transformers import CLIPImageProcessor
+from huggingface_hub import snapshot_download
 
 from dataset_and_utils import TokenEmbeddingsHandler
 
 SDXL_MODEL_CACHE = "./sdxl-cache"
 REFINER_MODEL_CACHE = "./refiner-cache"
-SAFETY_CACHE = "./safety-cache"
-FEATURE_EXTRACTOR = "./feature-extractor"
-SDXL_URL = "https://weights.replicate.delivery/default/sdxl/sdxl-vae-fix-1.0.tar"
-REFINER_URL = (
-    "https://weights.replicate.delivery/default/sdxl/refiner-no-vae-no-encoder-1.0.tar"
-)
-SAFETY_URL = "https://weights.replicate.delivery/default/sdxl/safety-1.0.tar"
-
+SDXL_REPO = "stabilityai/stable-diffusion-xl-base-1.0"
+REFINER_REPO = "stabilityai/stable-diffusion-xl-refiner-1.0"
 
 class KarrasDPM:
     def from_config(config):
         return DPMSolverMultistepScheduler.from_config(config, use_karras_sigmas=True)
-
 
 SCHEDULERS = {
     "DDIM": DDIMScheduler,
@@ -57,15 +46,6 @@ SCHEDULERS = {
     "PNDM": PNDMScheduler,
 }
 
-
-def download_weights(url, dest):
-    start = time.time()
-    print("downloading url: ", url)
-    print("downloading to: ", dest)
-    subprocess.check_call(["pget", "-x", url, dest])
-    print("downloading took: ", time.time() - start)
-
-
 class Predictor(BasePredictor):
     def load_trained_weights(self, weights, pipe):
         local_weights_cache = f"./trained-model"
@@ -73,14 +53,12 @@ class Predictor(BasePredictor):
         shutil.rmtree(local_weights_cache, ignore_errors=True)
 
         if not os.path.exists(local_weights_cache):
-            # pget -x doesn't like replicate.delivery
             weights = str(weights)
             weights = weights.replace(
                 "replicate.delivery/pbxt", "storage.googleapis.com/replicate-files"
             )
-            download_weights(weights, local_weights_cache)
+            snapshot_download(weights, local_dir=local_weights_cache)
 
-        # load UNET
         print("Loading fine-tuned model")
         self.is_lora = False
 
@@ -110,7 +88,6 @@ class Predictor(BasePredictor):
             unet_lora_attn_procs = {}
             name_rank_map = {}
             for tk, tv in tensors.items():
-                # up is N, d
                 if tk.endswith("up.weight"):
                     proc_name = ".".join(tk.split(".")[:-3])
                     r = tv.shape[1]
@@ -143,13 +120,11 @@ class Predictor(BasePredictor):
             unet.set_attn_processor(unet_lora_attn_procs)
             unet.load_state_dict(tensors, strict=False)
 
-        # load text
         handler = TokenEmbeddingsHandler(
             [pipe.text_encoder, pipe.text_encoder_2], [pipe.tokenizer, pipe.tokenizer_2]
         )
         handler.load_embeddings(os.path.join(local_weights_cache, "embeddings.pti"))
 
-        # load params
         with open(os.path.join(local_weights_cache, "special_params.json"), "r") as f:
             params = json.load(f)
         self.token_map = params
@@ -161,23 +136,13 @@ class Predictor(BasePredictor):
         start = time.time()
         self.tuned_model = False
 
-        print("Loading safety checker...")
-        if not os.path.exists(SAFETY_CACHE):
-            download_weights(SAFETY_URL, SAFETY_CACHE)
-        self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
-            SAFETY_CACHE, torch_dtype=torch.float16
-        ).to("cuda")
-        self.feature_extractor = CLIPImageProcessor.from_pretrained(FEATURE_EXTRACTOR)
-
-        if not os.path.exists(SDXL_MODEL_CACHE):
-            download_weights(SDXL_URL, SDXL_MODEL_CACHE)
-
         print("Loading sdxl txt2img pipeline...")
         self.txt2img_pipe = StableDiffusionXLPipeline.from_pretrained(
-            SDXL_MODEL_CACHE,
+            SDXL_REPO,
             torch_dtype=torch.float16,
             use_safetensors=True,
             variant="fp16",
+            cache_dir=SDXL_MODEL_CACHE,
         )
         self.is_lora = False
         if weights:
@@ -210,17 +175,8 @@ class Predictor(BasePredictor):
         self.inpaint_pipe.to("cuda")
 
         print("Loading SDXL refiner pipeline...")
-        # FIXME(ja): should the vae/text_encoder_2 be loaded from SDXL always?
-        #            - in the case of fine-tuned SDXL should we still?
-        # FIXME(ja): if the answer to above is use VAE/Text_Encoder_2 from fine-tune
-        #            what does this imply about lora + refiner? does the refiner need to know about
-
-        if not os.path.exists(REFINER_MODEL_CACHE):
-            download_weights(REFINER_URL, REFINER_MODEL_CACHE)
-
-        print("Loading refiner pipeline...")
         self.refiner = StableDiffusionXLPipeline.from_pretrained(
-            REFINER_MODEL_CACHE,
+            REFINER_REPO,
             text_encoder=self.txt2img_pipe.text_encoder,
             text_encoder_2=self.txt2img_pipe.text_encoder_2,
             tokenizer=self.txt2img_pipe.tokenizer,
@@ -228,26 +184,14 @@ class Predictor(BasePredictor):
             torch_dtype=torch.float16,
             use_safetensors=True,
             variant="fp16",
+            cache_dir=REFINER_MODEL_CACHE,
         )
         self.refiner.to("cuda")
         print("setup took: ", time.time() - start)
-        # self.txt2img_pipe.__class__.encode_prompt = new_encode_prompt
 
     def load_image(self, path):
         shutil.copyfile(path, "/tmp/image.png")
         return load_image("/tmp/image.png").convert("RGB")
-
-    def run_safety_checker(self, image):
-        safety_checker_input = self.feature_extractor(image, return_tensors="pt").to(
-            "cuda"
-        )
-        np_image = [np.array(val) for val in image]
-        image, has_nsfw_concept = self.safety_checker(
-            images=np_image,
-            clip_input=safety_checker_input.pixel_values.to(torch.float16),
-        )
-        return image, has_nsfw_concept
-
 
     @torch.inference_mode()
     def predict(
@@ -346,7 +290,6 @@ class Predictor(BasePredictor):
         print(f"Time took to load lora: {time.time() - start}")
         sdxl_kwargs = {}
         if self.tuned_model:
-            # consistency with fine-tuning API
             for k, v in self.token_map.items():
                 prompt = prompt.replace(k, v)
 
@@ -378,7 +321,6 @@ class Predictor(BasePredictor):
             sdxl_kwargs["output_type"] = "latent"
 
         if not apply_watermark:
-            # toggles watermark for this prediction
             watermark_cache = pipe.watermark
             pipe.watermark = None
             self.refiner.watermark = None
@@ -415,20 +357,10 @@ class Predictor(BasePredictor):
             pipe.watermark = watermark_cache
             self.refiner.watermark = watermark_cache
 
-        _, has_nsfw_content = self.run_safety_checker(output.images)
-
         output_paths = []
-        for i, nsfw in enumerate(has_nsfw_content):
-            if nsfw:
-                print(f"NSFW content detected in image {i}")
-                continue
+        for i in range(num_outputs):
             output_path = f"/tmp/out-{i}.png"
             output.images[i].save(output_path)
             output_paths.append(Path(output_path))
-
-        if len(output_paths) == 0:
-            raise Exception(
-                f"NSFW content detected. Try running it again, or try a different prompt."
-            )
 
         return output_paths
